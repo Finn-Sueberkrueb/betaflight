@@ -90,6 +90,13 @@
 
 #define MAVLINK_SYSTEM_ID 1
 #define MAVLINK_COMPONENT_ID MAV_COMP_ID_AUTOPILOT1
+#define MAVLINK_AUTOPILOT_VERSION_MIN_LEN 60
+#define MAVLINK_AUTOPILOT_VERSION_CRC 178
+#define MAVLINK_PX4_SW_VERSION ((1U << 24) | (14U << 16) | (0U << 8) | 0U)
+
+#ifndef MAVLINK_MSG_ID_AUTOPILOT_VERSION
+#define MAVLINK_MSG_ID_AUTOPILOT_VERSION 148
+#endif
 
 extern uint16_t rssi; // FIXME dependency on mw.c
 
@@ -198,6 +205,80 @@ static void mavlinkWriteMessage(mavlinkEndpoint_t *endpoint, const mavlink_messa
 {
     const uint16_t msgLength = mavlink_msg_to_send_buffer(mavBuffer, msg);
     mavlinkSerialWrite(endpoint, mavBuffer, msgLength);
+}
+
+static void mavlinkSendCommandAck(mavlinkEndpoint_t *endpoint, const mavlink_message_t *request, const uint16_t command, const uint8_t result)
+{
+    mavlink_message_t msg;
+    mavlink_msg_command_ack_pack(
+        MAVLINK_SYSTEM_ID,
+        MAVLINK_COMPONENT_ID,
+        &msg,
+        command,
+        result,
+        UINT8_MAX,
+        0,
+        request->sysid,
+        request->compid);
+    mavlinkWriteMessage(endpoint, &msg);
+}
+
+static void mavlinkSendAutopilotVersion(mavlinkEndpoint_t *endpoint)
+{
+    mavlink_message_t msg;
+    char payload[MAVLINK_AUTOPILOT_VERSION_MIN_LEN] = { 0 };
+
+    _mav_put_uint64_t(payload, 0, 0); // capabilities
+    _mav_put_uint64_t(payload, 8, 0); // uid
+    _mav_put_uint32_t(payload, 16, MAVLINK_PX4_SW_VERSION); // flight_sw_version
+    _mav_put_uint32_t(payload, 20, 0); // middleware_sw_version
+    _mav_put_uint32_t(payload, 24, 0); // os_sw_version
+    _mav_put_uint32_t(payload, 28, 0); // board_version
+    _mav_put_uint16_t(payload, 32, 0); // vendor_id
+    _mav_put_uint16_t(payload, 34, 0); // product_id
+    // flight_custom_version / middleware_custom_version / os_custom_version remain zeroed.
+
+    memcpy(_MAV_PAYLOAD_NON_CONST(&msg), payload, MAVLINK_AUTOPILOT_VERSION_MIN_LEN);
+    msg.msgid = MAVLINK_MSG_ID_AUTOPILOT_VERSION;
+    mavlink_finalize_message(
+        &msg,
+        MAVLINK_SYSTEM_ID,
+        MAVLINK_COMPONENT_ID,
+        MAVLINK_AUTOPILOT_VERSION_MIN_LEN,
+        MAVLINK_AUTOPILOT_VERSION_MIN_LEN,
+        MAVLINK_AUTOPILOT_VERSION_CRC);
+
+    mavlinkWriteMessage(endpoint, &msg);
+}
+
+static bool mavlinkMessageTargetsThisAutopilot(const mavlink_command_long_t *commandLong)
+{
+    return (commandLong->target_system == 0 || commandLong->target_system == MAVLINK_SYSTEM_ID)
+        && (commandLong->target_component == 0 || commandLong->target_component == MAVLINK_COMPONENT_ID);
+}
+
+static bool mavlinkHandleCommandLong(mavlinkEndpoint_t *endpoint, const mavlink_message_t *msg)
+{
+    mavlink_command_long_t commandLong;
+    mavlink_msg_command_long_decode(msg, &commandLong);
+
+    if (!mavlinkMessageTargetsThisAutopilot(&commandLong)) {
+        return false;
+    }
+
+    if (commandLong.command != MAV_CMD_REQUEST_MESSAGE) {
+        return false;
+    }
+
+    const uint16_t requestedMessageId = (uint16_t)commandLong.param1;
+    if (requestedMessageId == MAVLINK_MSG_ID_AUTOPILOT_VERSION) {
+        mavlinkSendAutopilotVersion(endpoint);
+        mavlinkSendCommandAck(endpoint, msg, MAV_CMD_REQUEST_MESSAGE, MAV_RESULT_ACCEPTED);
+    } else {
+        mavlinkSendCommandAck(endpoint, msg, MAV_CMD_REQUEST_MESSAGE, MAV_RESULT_UNSUPPORTED);
+    }
+
+    return true;
 }
 
 static uint8_t mavlinkGetStreamRate(const mavlinkStreamId_e streamId)
@@ -373,7 +454,7 @@ static void mavlinkSendHeartbeat(mavlinkEndpoint_t *endpoint)
         MAVLINK_COMPONENT_ID,
         &msg,
         mavSystemType,
-        MAV_AUTOPILOT_GENERIC,
+        MAV_AUTOPILOT_PX4,
         mavModes,
         mavCustomMode,
         mavSystemState);
@@ -602,6 +683,10 @@ static void mavlinkDataReceive(uint16_t c, void *data)
     const uint8_t result = mavlink_parse_char(endpoint->rxChannel, c, &endpoint->rxMsg, &endpoint->rxStatus);
 
     if (result != MAVLINK_FRAMING_OK) {
+        return;
+    }
+
+    if (endpoint->rxMsg.msgid == MAVLINK_MSG_ID_COMMAND_LONG && mavlinkHandleCommandLong(endpoint, &endpoint->rxMsg)) {
         return;
     }
 
